@@ -1,5 +1,6 @@
 #!/usr/bin/perl
 
+# 
 use strict;
 use warnings;
 use autodie;
@@ -9,7 +10,8 @@ use Carp;
 use Getopt::Long;
 
 use Data::Dumper;
-use List::MoreUtils qw( uniq );
+use List::Util      qw( first min max );
+use List::MoreUtils qw( first_index uniq );
 
 use Algorithm::NeedlemanWunsch;
 use Bio::SeqIO;
@@ -27,10 +29,25 @@ my $local_alignment;  # boolean; false = global, true = local; this refers
                       #     might still want to view the location of (say)
                       #     a short sequence aligned to the whole of a long
                       #     sequence
-my $create_alignment; # boolean; false = no alignment created or shown
+###my $create_alignment; # boolean; false = no alignment created or shown
+my $create_alignment; # 0 or undef means no alignment; other options are
+                      # 1 trim (if necessary) alignment so that it spans
+                      # sequence 1 and no further;
+                      # 2 trim (if necessary) alignment so that it spans
+                      # sequence 2 and no further;
+                      # 3 trim such that the alignment begins with the
+                      # first no-gap position and ends with the last
+                      # no-gap position (this is the harshest trim,
+                      # effectively producing a traditional local-alignment);
+                      # 4 no trimming;
+                      # instead of the numbers, can use 'none' for 0;
+                      # 'trimmed1' for 1; 'trimmed2' for 2; 'trimmed' for 3;
+                      # 'full', 'all', 'global' for 4.
 my $get_coords1;      # boolean; refer to arg name 'coords1' in NWalign()
 my $get_coords2;      # boolean; refer to arg name 'coords2' in NWalign()
 my $verbosity = 0;
+
+my @alignment_type = qw( none trimmed1 trimmed2 trimmed global );
 
 my $usage = qq{Usage:\n\n$0 [ -sequences ] SEQUENCE_FILE [ options ]\n};
 
@@ -41,8 +58,8 @@ die $usage if !GetOptions(
     "forward_primer|fwd_primer=s"    => \$fwd_primer,
     "reverse_primer|rev_primer=s"    => \$rev_primer,
     "matrix=s"                       => \$matrix_name,
-    "local_alignment"                => \$local_alignment,
-    "alignment"                      => \$create_alignment,
+    "local_scoring|local_alignment"  => \$local_alignment, # better as 'local_scoring'?
+    "alignment=s"                    => \$create_alignment,# then this can have value 'local'?
     "coords1"                        => \$get_coords1,
     "coords2"                        => \$get_coords2,
     "verbosity=i"                    => \$verbosity,
@@ -50,12 +67,30 @@ die $usage if !GetOptions(
 
 $sequence_file ||= shift or die $usage;
 
+$create_alignment ||= 0;
+
+if ($create_alignment =~ m{ \A \d \z }xms) {
+    die qq{invalid alignment type (should be 0 .. 4)\n}
+      if ($create_alignment < 0) || ($create_alignment > 4);
+}
+else {
+    $create_alignment =~ s{ \A (?:full|all) .* \z }{global}ixms;
+    my $idx = first_index { lc $_ eq $create_alignment } @alignment_type;
+    die qq{invalid alignment type '$create_alignment'} if $idx == -1;
+    $create_alignment = $idx;
+}
+
+print qq{alignment type: $alignment_type[$create_alignment]\n};
+
+
 # Default primers are EMP 16S:
 # http://www.earthmicrobiome.org/protocols-and-standards/16s/
 
 ###my $matrix_name = shift; #  || q{ednafull};
 
 die qq{no such file '$sequence_file'\n} if ! -f $sequence_file;
+
+
 
 my $seqio = Bio::SeqIO->new( -file   => $sequence_file,
                              -format => $sequence_format);
@@ -82,7 +117,7 @@ pairwise_align( sequence1   => $dnaseq,
                 sequence2   => [ $fwd_primer, $rev_primer_revcmp ],
                 local_align => $local_alignment,
                 matrix      => $matrix_href, # can be undef
-                alignment   => $create_alignment, # can be undef
+                alignment   => $create_alignment, 
                 coords1     => $get_coords1, # can be undef
                 coords2     => $get_coords2, # can be undef
                 verbosity   => 0,
@@ -335,6 +370,72 @@ sub reverse_complement {
     return $revcmp;
 }
 
+sub match_count {
+
+    # The two sequence strings must already be aligned.
+    # They should be the same length (might include gap characters).
+    # But if one is longer than the other, gap characters are assumed.
+    my $aligned_seq1 = shift;
+    my $aligned_seq2 = shift;
+    my $optimistic   = shift;
+    my $gap_char     = shift || q{-};
+
+    # unoptimistic not yet supported (would calculate probabilities)
+    croak qq{only 'optimistic' match counts supported}
+      if !$optimistic;
+
+    my %bases = (
+        A => [ 'A' ],
+        G => [ 'G' ],
+        C => [ 'C' ],
+        T => [ 'T' ],
+        Y => [ 'C', 'T' ],
+        R => [ 'A', 'G' ],
+        W => [ 'A', 'T' ],
+        S => [ 'G', 'C' ],
+        K => [ 'G', 'T' ],
+        M => [ 'A', 'C' ],
+        D => [ 'A', 'G', 'T' ],
+        V => [ 'A', 'C', 'G' ],
+        H => [ 'A', 'C', 'T' ],
+        B => [ 'C', 'G', 'T' ],
+        U => [ 'T' ],
+        N => [ 'A', 'C', 'G', 'T' ],
+        X => [ 'A', 'C', 'G', 'T' ],
+        $gap_char => [], # won't match anything, not even another gap
+    );
+
+    for my $b (keys %bases) {
+        push @{$bases{$b}}, 'U' if first { $_ eq 'T' } @{$bases{$b}};
+    }
+
+    my $aln_length = max length($aligned_seq1), length($aligned_seq2);
+    # show a warning if not the same length...
+
+    for my $seq ($aligned_seq1, $aligned_seq2) {
+        my $short = $aln_length - length $seq;
+        $seq .= $gap_char x $short;
+    }
+
+    my $n_matches = 0;
+
+    for my $i ( 0 .. $aln_length - 1 ) {
+
+        my $base1 = substr $aligned_seq1, $i, 1;
+        my $base2 = substr $aligned_seq2, $i, 1;
+
+        my $n_options1 = scalar @{$bases{$base1}};
+        my $n_options2 = scalar @{$bases{$base2}};
+        my @union = uniq (@{$bases{$base1}}, @{$bases{$base2}});
+        # If the two sets are mutually exclusive, then the size of the union
+        # is the sum of the sizes of the two sets; otherwise, they have at
+        # least one base in common, which is a 'match' in optimistic-speak
+        $n_matches++ if scalar(@union) < $n_options1 + $n_options2;
+    }
+
+    return $n_matches, $n_matches / $aln_length;
+}
+
 sub pairwise_align {
 
 =pod
@@ -354,6 +455,34 @@ sub pairwise_align {
     residues as a list, i.e. one letter per element. With a single call of
     pairwise_align(), the first sequence need be prepared only once.
 
+    Some arguments (values of %arg, see below) are consumed by this current
+    subroutine, i.e. with keys:
+
+            'sequence1', 'sequence2' (see above)
+            'dna'
+
+    Most arguments are passed straight to NWalign, without any intervention
+    in the current subroutine, by passing what remains of %arg (see below);
+    keys are:
+
+            'gap_open'   , 'gap_extend',
+            'local_align',
+            'matrix'     ,
+            'alignment'  ,
+            'coords1'    , 'coords2'   ,
+            'verbosity'
+
+    'alignment' is an exception; it is passed as a boolean to NWalign (directs
+    that to either not create, or create, an alignment) but within the
+    current subroutine pairwise_align() the different true values ( 1 .. 4)
+    have different meanings, which are applied here (how to trim the alignment,
+    if at all).
+
+    The current subroutine also creates addition key => value pairs, with keys:
+
+            'seqlist1'   , 'seqlist2'  ,
+
+
 =cut
 
     my %arg = @_;
@@ -361,6 +490,7 @@ sub pairwise_align {
     my $sequence1 = delete $arg{sequence1}; # expects scalar
     my $sequence2 = delete $arg{sequence2}; # scalar or ref to array of scalars
     my $type      = delete $arg{type}; # 'dna', 'rna', 'protein'
+    my $alignment_type = $arg{alignment}; # intentionally not deleted
 
     croak qq{no first sequence specified}    if !defined $sequence1;
     croak qq{no other sequence(s) specified} if !defined $sequence2;
@@ -403,8 +533,19 @@ sub pairwise_align {
 ###        print qq{alignment }, ++$n_alignment, qq{:\n\n},
 
         print qq{score: $alignment_score:\n\n};
-        print qq{$results{alignment}->[0]\n$results{alignment}->[1]\n\n}
-          if $results{alignment};
+
+        if ($alignment_type) {
+
+            my $display_alignment_aref =
+              trim_alignment($results{alignment},$alignment_type);
+
+            print qq{$display_alignment_aref->[0]\n},
+                  qq{$display_alignment_aref->[1]\n\n};
+            my ($matches, $matches_prpn) = match_count(@{$display_alignment_aref},1);
+print qq{match count: $matches (}, 100 * $matches_prpn  , qq{%)\n};
+            #print qq{$results{alignment}->[0]\n$results{alignment}->[1]\n\n}
+            #  if $results{alignment};
+        }
 
         show_coords($results{coords1}, scalar(@seqletters1),
             qq{coords of sequence 2 corresponding to coords of sequence 1},
@@ -415,6 +556,14 @@ sub pairwise_align {
             q{coords of sequence 1 corresponding to coords of sequence 2},
             q{seq2}, q{seq1})
           if $results{coords2};
+
+        # Save the results (conditionally requested) here, in a growing
+        # array (one element per alignment); each element will include,
+        # conditionally, the full (and display) alignment; the
+        # table(s) of counterpart-corresponding coordinates; number of
+        # mismatches in the display alignment, and thus the corresponding
+        # pairwise identity
+        # The alignment score will always be a result.
 
     }
 
@@ -435,6 +584,163 @@ sub show_coords {
         $paired_coord = q{-} if !defined $paired_coord;
         printf qq{\t%8d\t%8s\n}, $i, $paired_coord;
     }
+
+}
+
+sub trim_alignment {
+
+    my $alignment_aref = shift; # 2 elements; 1 string per sequence
+    my $alignment_type = shift || 4; # default just returns the original
+
+=pod
+
+    The meaning of $alignment_type:
+
+    Notionally, 0 means that no alignment results; but if that's the case,
+    then this subroutine is unlikely to have been called in the first place.
+
+    1: The alignment is trimmed at both ends, such that the resulting
+    alignment begins with the first letter of the first sequence, and ends
+    with the last letter of the first sequence.
+
+    2: The alignment is trimmed at both ends, such that the resulting
+    alignment begins with the first letter of the second sequence, and ends
+    with the last letter of the second sequence.
+
+    3: The alignment is trimmed at both ends, such that the resulting
+    alignment begins with the first position that is occupied by a letter
+    (rather than a gap character) of both sequences, and ends with the last
+    position that is occupied by a letter of both sequences.
+
+    4: The alignment is not trimmed; in other words, the whole of both
+    sequences is included; note that this is the case even if the local-
+    alignment variant of the algorith is applied (see -local_alignment).
+    The local alignment algorithm simply affects the way that gaps at
+    each end of the aligned sequences are scored.
+
+    For example, if you always want the returned alignment to represent a
+    local alignment in the traditional sense - i.e. parts of both sequences
+    which do not align with the other sequence are trimmed off (but only at
+    both ends), then that is type 3. E.g.:
+
+    sequence 1  ACGCGCTTTC--CGCGAG-----
+    sequence 2  -----CTTTCGAGGAGAGTAATA
+
+    becomes with type 3:
+
+    sequence 1  CTTTC--CGCGAG
+    sequence 2  CTTTCGAGGAGAG
+
+    whereas with type 1:
+
+    sequence 1  ACGCGCTTTC--CGCGAG
+    sequence 2  -----CTTTCGAGGAGAG
+
+    with type 2:
+
+    sequence 1  CTTTC--CGCGAG-----
+    sequence 2  CTTTCGAGGAGAGTAATA
+
+    If you are expecting one sequence to be much shorter than the other, and
+    you want a representation of to where on the longer sequence the
+    shorter one aligns; e.g. if the first sequence was a long genomic sequence
+    and the second represented a short PCR primer; then use (in this example)
+    type 2.
+
+    Note that the trimming positions are not determined from the tables of
+    counterpart-aligned coordinates of each sequence - because the creation of
+    those tables is only conditional.
+
+=cut
+
+    return if !$alignment_type; # maybe returning [ q{}, q{} ] is better?
+
+    return $alignment_aref if $alignment_type == 4;
+
+    my $aln_first;
+    my $aln_last;
+
+    my $first1;
+    my $last1;
+    my $first2;
+    my $last2;
+
+#    my ($first1, $last1) = non_gap_limits($alignment_aref->[0]);
+#    my ($first2, $last2) = non_gap_limits($alignment_aref->[1]);
+
+    ALN_TYPE: {
+
+        (($alignment_type == 1) || ($alignment_type == 3)) && do {
+
+            ($first1, $last1) = non_gap_limits($alignment_aref->[0]);
+
+            ($alignment_type == 1) && do {
+                $aln_first = $first1;
+                $aln_last  = $last1;
+                last ALN_TYPE;
+            };
+
+        };
+
+        (($alignment_type == 2) || ($alignment_type == 3)) && do {
+            ($first2, $last2) = non_gap_limits($alignment_aref->[1]);
+
+            ($alignment_type == 2) && do {
+                $aln_first = $first2;
+                $aln_last  = $last2;
+                last ALN_TYPE;
+            };
+        };
+
+        ($alignment_type == 3) && do {
+
+            $aln_first = max $first1, $first2;
+            $aln_last  = min $last1 , $last2;
+            last ALN_TYPE;
+        };
+
+        croak qq{invalid alignment-trimming code: $alignment_type};
+
+    } # END block ALN_TYPE
+
+    my $trimmed_length = 1 + $aln_last - $aln_first;
+
+    my @trimmed_alignment =
+      map { substr $_, $aln_first, $trimmed_length } @{$alignment_aref};
+
+    return \@trimmed_alignment;
+
+}
+
+sub non_gap_limits {
+
+    my $string   = shift;
+    my $gap_char = shift || q{-};
+
+    my $length = length $string;
+
+    my $first_non_gap;
+    my $last_non_gap;
+
+    # Maybe more efficient to do this with a s/// substitution and then use
+    # the lengths of the bits trimmed off to determine the limit?
+
+    for my $i ( 0 .. $length - 1) {
+
+        if (!defined($first_non_gap) && substr($string, $i, 1) ne $gap_char) {
+            $first_non_gap = $i;
+            return ($first_non_gap, $last_non_gap) if defined $last_non_gap;
+        }
+
+        if (!defined($last_non_gap) &&
+            substr($string, -1*($i+1), 1) ne $gap_char) {
+            $last_non_gap = $length - $i - 1;
+            return ($first_non_gap, $last_non_gap) if defined $first_non_gap;
+        }
+
+    }
+
+    return ($first_non_gap, $last_non_gap); # can only be (undef, undef)
 
 }
 
@@ -467,7 +773,7 @@ sub NWalign {
 
 =pod
 
-    If the key => value pair coords1 => $coords1_aref has been supplied, then
+    If the value of the coords1 key is true, then
     an array is created, with the same number of elements as there are letters
     in sequence 1; each value is the coordinate of sequence2 to which the
     letter in sequence1 has been aligned. To repeat: the indices represent the
@@ -475,10 +781,14 @@ sub NWalign {
     the values represent the coords of sequence2 (corresponding to the indices
     of @{$seq_aref2}).
 
-    Conversely, if coords2 => $coords2_aref has been supplied, then an array
+    A ref to that array is then returned as the value of the 'coords1' key of
+    the %optional_results hash.
+
+    Conversely, if coords2 has a true value an array
     is created, with the same number of elements as there are letters in
     sequence 2; each value is the coordinate of sequence1 to which the letter
-    in sequence2 has been aligned.
+    in sequence2 has been aligned. A ref to that array is then returned as the
+    value of the 'coords2' key of the %optional_results hash.
 
     These arrays can be requested optionally and independently for the sake of
     efficiency; if NWalign is being called many times, then building these
@@ -670,55 +980,42 @@ sub NWalign {
     return $score, %optional_results; 
 }
 
-###sub score_sub {
-###    if (!@_) {
-###        return -2; # gap penalty
-###    }
-### 
-###    return ($_[0] eq $_[1]) ? 5 : -4;
-###}
+=head1 AUTHOR
 
-=pod 
-sub on_align {
-
-    my @arg = @_;
-    my $i = 0;
-
-    for my $arg (@arg) {
-        print qq{on_align\t}, $i, qq{, '$arg', }, $seq[$i]->[$arg], qq{\n};
-        $alignment[$i] = $seq[$i]->[$arg]. $alignment[$i];
-        $i++;
-    }
-    print qq{\n};
-}
-
-sub on_shift_a {
-
-    my $i = 0;
-    for my $arg (@_) {
-        print qq{on_shift_a\t}, $i, qq{, $arg, }, $seq[0]->[$arg], qq{\n};
-        $alignment[0] = $seq[0]->[$arg]. $alignment[0];
-        $alignment[1] = q{-} . $alignment[1];
-        $i++;
-    }
-
-}
-
-sub on_shift_b {
-
-    my $i = 0;
-    for my $arg (@_) {
-        print qq{on_shift_b\t}, $i, qq{, $arg, }, $seq[1]->[$arg], qq{\n};
-        $alignment[0] = q{-} . $alignment[0];
-        $alignment[1] = $seq[1]->[$arg]. $alignment[1];
-        $i++;
-    }
-
-}
-
-=cut
+John Walshaw
 
 
-#my @aligned = ( [ ], [ ] );
+=head1 LICENCE AND COPYRIGHT
+
+Copyright (c) 2019, John Walshaw. All rights reserved.
+
+Developed in my own time using my own resources.
+
+This is free software; you can redistribute it and/or
+modify it under the same terms as Perl itself. See L<perlartistic>.
+
+
+=head1 DISCLAIMER OF WARRANTY
+
+BECAUSE THIS SOFTWARE IS LICENSED FREE OF CHARGE, THERE IS NO WARRANTY
+FOR THE SOFTWARE, TO THE EXTENT PERMITTED BY APPLICABLE LAW. EXCEPT WHEN
+OTHERWISE STATED IN WRITING THE COPYRIGHT HOLDERS AND/OR OTHER PARTIES
+PROVIDE THE SOFTWARE "AS IS" WITHOUT WARRANTY OF ANY KIND, EITHER
+EXPRESSED OR IMPLIED, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED
+WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE. THE
+ENTIRE RISK AS TO THE QUALITY AND PERFORMANCE OF THE SOFTWARE IS WITH
+YOU. SHOULD THE SOFTWARE PROVE DEFECTIVE, YOU ASSUME THE COST OF ALL
+NECESSARY SERVICING, REPAIR, OR CORRECTION.
+
+IN NO EVENT UNLESS REQUIRED BY APPLICABLE LAW OR AGREED TO IN WRITING
+WILL ANY COPYRIGHT HOLDER, OR ANY OTHER PARTY WHO MAY MODIFY AND/OR
+REDISTRIBUTE THE SOFTWARE AS PERMITTED BY THE ABOVE LICENCE, BE
+LIABLE TO YOU FOR DAMAGES, INCLUDING ANY GENERAL, SPECIAL, INCIDENTAL,
+OR CONSEQUENTIAL DAMAGES ARISING OUT OF THE USE OR INABILITY TO USE
+THE SOFTWARE (INCLUDING BUT NOT LIMITED TO LOSS OF DATA OR DATA BEING
+RENDERED INACCURATE OR LOSSES SUSTAINED BY YOU OR THIRD PARTIES OR A
+FAILURE OF THE SOFTWARE TO OPERATE WITH ANY OTHER SOFTWARE), EVEN IF
+SUCH HOLDER OR OTHER PARTY HAS BEEN ADVISED OF THE POSSIBILITY OF
+SUCH DAMAGES.
 
 
