@@ -11,7 +11,7 @@ use Getopt::Long;
 
 use Data::Dumper;
 use List::Util      qw( first min max );
-use List::MoreUtils qw( first_index uniq );
+use List::MoreUtils qw( first_index uniq mesh );
 
 use Algorithm::NeedlemanWunsch;
 use Bio::SeqIO;
@@ -29,7 +29,7 @@ my $local_alignment;  # boolean; false = global, true = local; this refers
                       #     might still want to view the location of (say)
                       #     a short sequence aligned to the whole of a long
                       #     sequence
-###my $create_alignment; # boolean; false = no alignment created or shown
+
 my $create_alignment; # 0 or undef means no alignment; other options are
                       # 1 trim (if necessary) alignment so that it spans
                       # sequence 1 and no further;
@@ -43,11 +43,19 @@ my $create_alignment; # 0 or undef means no alignment; other options are
                       # instead of the numbers, can use 'none' for 0;
                       # 'trimmed1' for 1; 'trimmed2' for 2; 'trimmed' for 3;
                       # 'full', 'all', 'global' for 4.
+my $show_alignment;
+
 my $get_coords1;      # boolean; refer to arg name 'coords1' in NWalign()
 my $get_coords2;      # boolean; refer to arg name 'coords2' in NWalign()
+
+my $report_frequency = 10000;
 my $verbosity = 0;
 
 my @alignment_type = qw( none trimmed1 trimmed2 trimmed global );
+
+# secondary as in, the secondary sequences which are each aligned versus the
+# principal sequence, which is the (next) sequence from the data file
+my @secondary_labels = qw( fwd rev );
 
 my $usage = qq{Usage:\n\n$0 [ -sequences ] SEQUENCE_FILE [ options ]\n};
 
@@ -62,7 +70,9 @@ die $usage if !GetOptions(
     "alignment=s"                    => \$create_alignment,# then this can have value 'local'?
     "coords1"                        => \$get_coords1,
     "coords2"                        => \$get_coords2,
-    "verbosity=i"                    => \$verbosity,
+    "show_alignments"                => \$show_alignment,
+    "report_frequency=i"             => \$report_frequency, # units: sequences read
+    "verbosity|verbose=i"            => \$verbosity,
 );
 
 $sequence_file ||= shift or die $usage;
@@ -80,7 +90,7 @@ else {
     $create_alignment = $idx;
 }
 
-print qq{alignment type: $alignment_type[$create_alignment]\n};
+print qq{alignment type: $alignment_type[$create_alignment]\n} if $verbosity;
 
 
 # Default primers are EMP 16S:
@@ -95,17 +105,12 @@ die qq{no such file '$sequence_file'\n} if ! -f $sequence_file;
 my $seqio = Bio::SeqIO->new( -file   => $sequence_file,
                              -format => $sequence_format);
 
-my $seqobj = $seqio->next_seq();
-
-( my $dnaseq = $seqobj->seq() ) =~ s{ U }{T}gxms;
-
-print qq{$dnaseq\n};
-
 my $rev_primer_revcmp = reverse_complement($rev_primer);
 
 print qq{forward primer:\t$fwd_primer\n},
       qq{reverse primer:\t$rev_primer\n},
-      qq{reverse complement of reverse primer:\t$rev_primer_revcmp\n};
+      qq{reverse complement of reverse primer:\t$rev_primer_revcmp\n}
+  if $verbosity;
 
 # To ensure that the substitution matrix is created once and only once, it is
 # done now, and then passed to the aligner
@@ -113,7 +118,16 @@ print qq{forward primer:\t$fwd_primer\n},
 # will be undef if there is no $matrix_name
 my $matrix_href = create_subst_matrix($matrix_name);
 
-pairwise_align( sequence1   => $dnaseq,
+my $n_sequences = 0;
+
+while (my $seqobj = $seqio->next_seq()) {
+
+    ( my $dnaseq = $seqobj->seq() ) =~ s{ U }{T}gxms;
+
+###print qq{$dnaseq\n};
+
+    my $alignment_data_aref = pairwise_align(
+                sequence1   => $dnaseq,
                 sequence2   => [ $fwd_primer, $rev_primer_revcmp ],
                 local_align => $local_alignment,
                 matrix      => $matrix_href, # can be undef
@@ -123,6 +137,57 @@ pairwise_align( sequence1   => $dnaseq,
                 verbosity   => 0,
               );
 
+    my @metrics; # 2 elements, 1 per alignment
+    my @alignment_display;
+
+    for my $aln_index ( 0 .. 1 ) {
+
+        my %aln_data = %{$alignment_data_aref->[$aln_index]};
+
+        @{$metrics[$aln_index]} = (
+#            $seqobj->display_id(),
+            $aln_data{score},
+        );
+        push @{$metrics[$aln_index]}, $aln_data{matches}
+          if exists $aln_data{matches};
+
+        push @{$metrics[$aln_index]},
+          sprintf(qq{%4.2f}, $aln_data{identity}),
+          if exists $aln_data{identity};
+
+        if ($get_coords2) {
+#            my ($min_coord, $max_coord) = $aln_data{coords2};
+###print Dumper $aln_data{coords2};
+            my @coords2_nogaps = grep { defined $_ } @{$aln_data{coords2}};
+            my $min_coord  = min @coords2_nogaps;
+            my $max_coord  = max @coords2_nogaps;
+            my $coord_span = 1 + $max_coord - $min_coord;
+            push @{$metrics[$aln_index]}, $min_coord, $max_coord, $coord_span;
+        }
+
+        if ($show_alignment && exists $aln_data{display_alignment}) {
+            my @aln_string = @{$aln_data{display_alignment}};
+            for my $str_idx ( 0 , 2 , 1 ) {
+                push @alignment_display, qq{$aln_string[$str_idx]};
+            }
+            push @alignment_display, q{};
+        }
+    }
+
+    my @met0 = @{$metrics[0]};
+    my @met1 = @{$metrics[1]};
+    my @meshed_metrics = mesh @met0, @met1;
+
+    print join(qq{\t}, $seqobj->display_id(),
+               @meshed_metrics), qq{\n};
+
+    print join(qq{\n}, @alignment_display, q{});
+
+#    print STDERR Dumper $alignment_data_aref;
+
+    print STDERR qq{$n_sequences sequences read\n}
+      if !(++$n_sequences % $report_frequency);
+}
 #print qq{$score\n\n}, join(qq{\n}, @alignment), qq{\n};
 
 exit 0;
@@ -344,8 +409,8 @@ sub reverse_complement {
         T => 'A',
         Y => 'R',
         R => 'Y',
-        W => 'S',
-        S => 'W',
+        W => 'W',
+        S => 'S',
         K => 'M',
         M => 'K',
         D => 'H',
@@ -418,11 +483,37 @@ sub match_count {
     }
 
     my $n_matches = 0;
+    my $match_string = q{};
 
+    ALN_POS:
     for my $i ( 0 .. $aln_length - 1 ) {
 
         my $base1 = substr $aligned_seq1, $i, 1;
         my $base2 = substr $aligned_seq2, $i, 1;
+
+        # For efficiency, a couple of short-circuits are applied prior
+        # to the general-case comparison (which would still work with
+        # these 'special' cases); firstly, check whether either base is
+        # an unambiguous code (has connotations for comparing genomic
+        # sequence to a primer sequence, where ambiguity codes are
+        # effectively representing multiple variants of one sequence).
+
+        my $n_unambiguous = 0;
+
+        for my $b ($base1, $base2) {
+            $n_unambiguous++ if $b =~ m{ \A [ACGT] \z }xms;
+        }
+        
+        if ($base1 eq $base2) {
+            $n_matches++;
+            if ($n_unambiguous) { # necesarily == 2
+                $match_string .= q{|}; # e.g. A versus A
+            }
+            else {
+                $match_string .= q{:}; # e.g. W versus W
+            }
+            next ALN_POS;
+        }
 
         my $n_options1 = scalar @{$bases{$base1}};
         my $n_options2 = scalar @{$bases{$base2}};
@@ -430,10 +521,21 @@ sub match_count {
         # If the two sets are mutually exclusive, then the size of the union
         # is the sum of the sizes of the two sets; otherwise, they have at
         # least one base in common, which is a 'match' in optimistic-speak
-        $n_matches++ if scalar(@union) < $n_options1 + $n_options2;
+        if (scalar(@union) < $n_options1 + $n_options2) {
+            $n_matches++;
+            if ($n_unambiguous) { # necesarily == 1
+                $match_string .= q{|}; # e.g. A versus W (A or T)
+            }
+            else {
+                $match_string .= q{.}; # e.g. W versus R (both include A)
+            }
+            next ALN_POS;
+        }
+
+        $match_string .= q{ };
     }
 
-    return $n_matches, $n_matches / $aln_length;
+    return $n_matches, $n_matches / $aln_length, $match_string;
 }
 
 sub pairwise_align {
@@ -514,7 +616,16 @@ sub pairwise_align {
     my @seqletters1 = split m{}xms, $sequence1;
 #    my @seqletters_list;
 
-    my $n_alignment = 0;
+#    my $n_alignment = 0;
+
+    my @alignment_result; # One element per pairwise alignment; i.e. the
+                          # total number of elements is 1 less than the
+                          # total number of sequences.
+
+    # Iterates over 2nd sequence [ to 3rd [ , 4th [, 5th ... ] ] ]
+    # using each in turn as the 2nd sequence of a pairwise alignment, the 1st
+    # sequence of that alignment always being the same (the 1st sequence
+    # provided to the subroutine).
 
     for my $seq (@sequences) {
 
@@ -532,17 +643,31 @@ sub pairwise_align {
 ###        my $score = pop @alignment;
 ###        print qq{alignment }, ++$n_alignment, qq{:\n\n},
 
-        print qq{score: $alignment_score:\n\n};
+        print qq{score: $alignment_score:\n\n} if $verbosity > 1;
+
+        $results{score} = $alignment_score; # minimal result
 
         if ($alignment_type) {
 
+            # This can result in an unchanged alignment (if type is 4
+            # i.e. 'global')
             my $display_alignment_aref =
               trim_alignment($results{alignment},$alignment_type);
 
+            my ($matches, $matches_prpn, $match_string) =
+              match_count(@{$display_alignment_aref},1);
+
+            my @display_alignment = (@{$display_alignment_aref}, $match_string);
+
+            $results{display_alignment} = \@display_alignment;
+            $results{matches}           = $matches;
+            $results{identity}          = $matches_prpn; # not % identity
+
             print qq{$display_alignment_aref->[0]\n},
-                  qq{$display_alignment_aref->[1]\n\n};
-            my ($matches, $matches_prpn) = match_count(@{$display_alignment_aref},1);
-print qq{match count: $matches (}, 100 * $matches_prpn  , qq{%)\n};
+                  qq{$match_string\n},
+                  qq{$display_alignment_aref->[1]\n\n},
+                  qq{match count: $matches (}, 100 * $matches_prpn  , qq{%)\n}
+              if $verbosity > 1;
             #print qq{$results{alignment}->[0]\n$results{alignment}->[1]\n\n}
             #  if $results{alignment};
         }
@@ -550,12 +675,12 @@ print qq{match count: $matches (}, 100 * $matches_prpn  , qq{%)\n};
         show_coords($results{coords1}, scalar(@seqletters1),
             qq{coords of sequence 2 corresponding to coords of sequence 1},
             qq{seq1}, qq{seq2})
-          if $results{coords1};
+          if $results{coords1} && ($verbosity > 1);
 
         show_coords($results{coords2}, scalar(@seqletters),
             q{coords of sequence 1 corresponding to coords of sequence 2},
             q{seq2}, q{seq1})
-          if $results{coords2};
+          if $results{coords2} && ($verbosity > 1);
 
         # Save the results (conditionally requested) here, in a growing
         # array (one element per alignment); each element will include,
@@ -565,7 +690,12 @@ print qq{match count: $matches (}, 100 * $matches_prpn  , qq{%)\n};
         # pairwise identity
         # The alignment score will always be a result.
 
-    }
+        push @alignment_result, \%results;
+        print Dumper \%results if $verbosity > 2;
+
+    } # END for my $seq (@sequences)
+
+    return \@alignment_result;
 
 }
 
